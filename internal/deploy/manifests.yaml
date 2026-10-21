@@ -1,0 +1,135 @@
+# Rendered by `kharness bootstrap` (text/template: .Image, .BasePath, .Models, .TelegramChats).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kharness
+---
+# Node-local image registry: containerd on the node pulls localhost:5000/<image>. Images are pushed from the
+# laptop through an ssh tunnel (make push). Listens on 127.0.0.1 only.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: registry, namespace: kharness}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 5Gi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: registry, namespace: kharness, labels: {app: registry}}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: registry}}
+  template:
+    metadata: {labels: {app: registry}}
+    spec:
+      hostNetwork: true
+      containers:
+        - name: registry
+          image: registry:3
+          env:
+            - {name: REGISTRY_HTTP_ADDR, value: "127.0.0.1:5000"}
+            - {name: REGISTRY_STORAGE_DELETE_ENABLED, value: "true"}
+          volumeMounts: [{name: data, mountPath: /var/lib/registry}]
+          resources: {requests: {cpu: 10m, memory: 32Mi}, limits: {memory: 256Mi}}
+      volumes: [{name: data, persistentVolumeClaim: {claimName: registry}}]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: kharness, namespace: kharness}
+---
+# Effectively cluster-admin: installing charts needs CRDs and RBAC. The guardrails are in kharness itself
+# (approval gate for every change, protected namespaces, kubectl verb allowlist, audit log).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: kharness}
+rules:
+  - {apiGroups: ["*"], resources: ["*"], verbs: ["*"]}
+  - {nonResourceURLs: ["*"], verbs: ["get"]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: kharness}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: kharness}
+subjects: [{kind: ServiceAccount, name: kharness, namespace: kharness}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: kharness-config, namespace: kharness}
+data:
+  KHARNESS_DATA: /data
+  KHARNESS_BASE_PATH: "{{ .BasePath }}"
+  KHARNESS_MODELS: "{{ .Models }}"
+  TELEGRAM_CHAT_IDS: "{{ .TelegramChats }}"
+  KHARNESS_PROTECTED_NS: kube-system,kube-public,kube-node-lease,kharness
+  KHARNESS_WATCH: "true"
+  KHARNESS_AUTODIAGNOSE: "true"
+  KHARNESS_MAX_DIAG_PER_HOUR: "6"
+  HOME: /data
+  HELM_CACHE_HOME: /data/helm/cache
+  HELM_CONFIG_HOME: /data/helm/config
+  HELM_DATA_HOME: /data/helm/data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: kharness-data, namespace: kharness}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 1Gi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: kharness, namespace: kharness, labels: {app: kharness}}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: kharness}}
+  template:
+    metadata: {labels: {app: kharness}}
+    spec:
+      serviceAccountName: kharness
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532}
+      containers:
+        - name: kharness
+          image: "{{ .Image }}"
+          args: [serve]
+          envFrom:
+            - configMapRef: {name: kharness-config}
+            - secretRef: {name: kharness-secrets}
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: alerts, containerPort: 9094}
+          readinessProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 10}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 30, failureThreshold: 5}
+          resources: {requests: {cpu: 20m, memory: 64Mi}, limits: {memory: 512Mi}}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: data, persistentVolumeClaim: {claimName: kharness-data}}
+        - {name: tmp, emptyDir: {}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: kharness, namespace: kharness}
+spec:
+  selector: {app: kharness}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+    # Alertmanager webhook; deliberately not exposed through the Ingress.
+    - {name: alerts, port: 9094, targetPort: alerts}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kharness
+  namespace: kharness
+  # Traefik ranks routers by rule length, so Headlamp's Host(...) && PathPrefix(`/`) would swallow /kharness.
+  annotations: {traefik.ingress.kubernetes.io/router.priority: "1000"}
+spec:
+  ingressClassName: traefik
+  rules:
+    - http:
+        paths:
+          - {path: "{{ .BasePath }}", pathType: Prefix, backend: {service: {name: kharness, port: {name: http}}}}
